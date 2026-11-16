@@ -155,7 +155,7 @@ D:\Program Files\Chinatelecom\GDPortal
 
 ```
 HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run
-  Esurfing Client in Campus = D:\app\...\Chinatelecom_GDPortal\AutoStart.exe
+  Esurfing Client in Campus = D:\SomeDir\Chinatelecom_GDPortal\AutoStart.exe
 ```
 
 它和本脚本的计划任务会在登录时同时拉起同一个客户端。守护只在「进程不存在」时才动手，
