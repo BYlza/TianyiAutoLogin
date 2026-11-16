@@ -14,6 +14,12 @@ task.xml
 # 本机客户端安装路径（个人目录，勿提交）
 client-path.txt
 
+# 客户端 exe 的校验基准，与本机客户端版本绑定
+client-sha256.txt
+
+# 守护进程 PID
+watchdog.pid
+
 # 由 -Install 自动生成的启动器，内含本机绝对路径
 天翼校园自动登录.vbs
 
