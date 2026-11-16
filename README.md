@@ -85,19 +85,35 @@ powershell -ExecutionPolicy Bypass -File TianyiAutoLogin.ps1 -Uninstall
 powershell -ExecutionPolicy Bypass -File TianyiAutoLogin.ps1
 ```
 
-### 配置客户端路径
+### 客户端路径（多数情况不用配）
 
-脚本默认按 `C:\Program Files (x86)\Chinatelecom\GDPortal` 找客户端。装到别处时，**二选一**：
+脚本按这个顺序找客户端：
 
-1. 改脚本顶部的 `$ClientDir`；或
-2. 在脚本同目录建 `client-path.txt`（部署后即 `%ProgramData%\TianyiAutoLogin\client-path.txt`），
-   里面写一行真实路径：
+1. 脚本同目录的 `client-path.txt`（存在就用它，优先级最高）
+2. **注册表自动探测**：卸载项里的 `DisplayIcon` / `InstallLocation`、`Run` 项里的 `AutoStart.exe`
+3. 常见默认位置 `C:\Program Files (x86)\Chinatelecom\GDPortal`
 
-   ```
-   E:\Tools\Chinatelecom_GDPortal
-   ```
+所以客户端装在 D 盘、E 盘还是自定义目录，一般都能自己认出来，**不需要手动配置**。
 
-`-Install` 会把这个文件一起带到部署目录。它和 `client-sha256.txt` 都已在 `.gitignore` 中。
+只有两种情况需要干预：
+
+- 客户端装在非常规位置、注册表里又没有任何记录 —— 这时 `-Install` 会**明确报错并停下**，
+  不会出现"装完了但永远拉不起来"
+- 你想让它用另一份客户端
+
+这时在脚本同目录新建 `client-path.txt`，写一行真实路径：
+
+```
+D:\Program Files\Chinatelecom\GDPortal
+```
+
+> 记事本另存时把"保存类型"选成**所有文件**，否则会存成 `client-path.txt.txt`，脚本读不到。
+
+`-DryRun` 里的「路径来源」会告诉你是 `client-path.txt`、`自动探测` 还是 `自动探测（回退）`
+（后者表示配置的路径已失效、脚本自动改正了，建议更新那个文件）。
+
+`-Install` 会把最终解析到的路径写进部署目录，部署后即 `%ProgramData%\TianyiAutoLogin\client-path.txt`。
+它和 `client-sha256.txt` 都已在 `.gitignore` 中。
 
 ### 部署后有哪些文件
 

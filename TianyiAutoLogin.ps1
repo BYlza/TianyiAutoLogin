@@ -119,12 +119,89 @@ $PidFile        = Join-Path $ScriptDir 'watchdog.pid'
 # 天翼校园客户端安装目录。默认值只是常见安装位置，请按自己机器的实际路径修改；
 # 也可以不改脚本，直接在本脚本同目录新建 client-path.txt 写一行真实路径
 #（该文件已被 .gitignore 忽略，不会误提交）。
+# ---------- 客户端位置 ----------
+# 别人机器上的安装路径五花八门，不能只认一个默认值。探测顺序：
+#   1) 脚本同目录的 client-path.txt（显式指定，优先级最高）
+#   2) 注册表：卸载项的 DisplayIcon / InstallLocation、Run 项里的 AutoStart.exe
+#   3) 常见默认位置
+# 都找不到就返回 $null，由 -Install 明确报错，而不是"装完了但拉不起来"。
+function Find-ClientInstalledDir {
+    $candidates = @()
+
+    # 注册表卸载项（安装器一定会写，最可靠）
+    $uninstallKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($k in $uninstallKeys) {
+        Get-ItemProperty -Path $k -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -and $_.DisplayName -match '天翼校园|ESurfing|Chinatelecom|GDPortal' } |
+            ForEach-Object {
+                if ($_.InstallLocation) { $candidates += [string]$_.InstallLocation }
+                if ($_.DisplayIcon) {
+                    $icon = ([string]$_.DisplayIcon).Trim().Trim('"')
+                    if ($icon -and (Test-Path -LiteralPath $icon)) { $candidates += (Split-Path -Parent $icon) }
+                }
+            }
+    }
+
+    # Run 项：客户端自启指向的 AutoStart.exe / ESurfingClient.exe
+    foreach ($k in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run')) {
+        $props = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
+        if (-not $props) { continue }
+        foreach ($p in $props.PSObject.Properties) {
+            if ($p.Name -like 'PS*') { continue }
+            $v = [string]$p.Value
+            if ($v -notmatch 'AutoStart\.exe|ESurfingClient\.exe') { continue }
+            $exe = $v.Trim()
+            if ($exe.StartsWith('"')) {
+                $end = $exe.IndexOf('"', 1)
+                if ($end -gt 1) { $exe = $exe.Substring(1, $end - 1) }
+            } else {
+                $exe = ($exe -split ' ')[0]
+            }
+            if ($exe -and (Test-Path -LiteralPath $exe)) { $candidates += (Split-Path -Parent $exe) }
+        }
+    }
+
+    # 常见默认位置
+    $candidates += 'C:\Program Files (x86)\Chinatelecom\GDPortal'
+    $candidates += 'C:\Program Files\Chinatelecom\GDPortal'
+
+    foreach ($c in $candidates) {
+        if (-not $c) { continue }
+        $dir = $c.Trim().TrimEnd('\')
+        if ($dir -and (Test-Path -LiteralPath (Join-Path $dir 'ESurfingClient.exe'))) { return $dir }
+    }
+    return $null
+}
+
 $ClientDir = 'C:\Program Files (x86)\Chinatelecom\GDPortal'
+$ClientPathSource = '默认路径'
 if ((Test-PathAccessible $ClientPathFile) -eq $true) {
     $rawCfg = Get-Content -LiteralPath $ClientPathFile -Raw -ErrorAction SilentlyContinue
     if ($rawCfg) {
         $rawCfg = $rawCfg.Trim().TrimStart([char]0xFEFF).Trim()
-        if ($rawCfg) { $ClientDir = $rawCfg }
+        if ($rawCfg) {
+            $ClientDir = $rawCfg
+            $ClientPathSource = 'client-path.txt'
+        }
+    }
+}
+# 配置的路径下没有客户端（换了机器、客户端搬家、路径写错）→ 自动找一次
+if (-not (Test-Path -LiteralPath (Join-Path $ClientDir 'ESurfingClient.exe'))) {
+    $autoDir = Find-ClientInstalledDir
+    if ($autoDir) {
+        if ($ClientPathSource -eq 'client-path.txt') {
+            $ClientPathSource = '自动探测（回退）'
+        } else {
+            $ClientPathSource = '自动探测'
+        }
+        $ClientDir = $autoDir
     }
 }
 $ClientExe      = Join-Path $ClientDir 'ESurfingClient.exe'
@@ -573,6 +650,23 @@ if ($Install) {
     Write-InstallLog '===== -Install 开始（已提权）====='
     Write-InstallLog ("部署目录: {0}" -f $DeployDir)
 
+    # 0) 先确认客户端真的在。以前不检查，结果是"装完了但永远拉不起来"，
+    #    只在日志里每 5 分钟刷一行"客户端不存在"，别人根本不会去看日志。
+    if (-not (Test-Path -LiteralPath $ClientExe)) {
+        Write-InstallLog ("安装中止：找不到客户端 {0}" -f $ClientExe)
+        Write-InstallLog ("  路径来源：{0}" -f $ClientPathSource)
+        Write-InstallLog '  已尝试：client-path.txt / 注册表（卸载项、Run 项）/ 常见默认位置'
+        Write-InstallLog ''
+        Write-InstallLog '  二选一：'
+        Write-InstallLog '   1) 在脚本同目录新建 client-path.txt，写一行客户端安装目录，重新执行 -Install'
+        Write-InstallLog '   2) 把脚本顶部的 $ClientDir 改成实际路径'
+        Write-InstallLog '  例（client-path.txt 内容）：'
+        Write-InstallLog '     D:\Program Files\Chinatelecom\GDPortal'
+        Write-InstallLog '  注意：记事本另存时把"保存类型"选成"所有文件"，否则会存成 client-path.txt.txt。'
+        exit 1
+    }
+    Write-InstallLog ("客户端: {0}（来源：{1}）" -f $ClientExe, $ClientPathSource)
+
     $dstPs1  = Join-Path $DeployDir 'TianyiAutoLogin.ps1'
     $dstVbs  = Join-Path $DeployDir '天翼校园自动登录.vbs'
     $dstCfg  = Join-Path $DeployDir 'client-path.txt'
@@ -877,6 +971,7 @@ if ($DryRun) {
     Write-Host ("部署副本    : {0}" -f $driftTxt)
     Write-Host ("计划任务    : {0}  {1}" -f $TaskName, $taskTxt)
     Write-Host ("客户端路径  : {0}  {1}" -f $checkClientExe, $(if (Test-Path $checkClientExe) { '存在' } else { '不存在' }))
+    Write-Host ("路径来源    : {0}" -f $ClientPathSource)
     Write-Host ("哈希校验    : {0}" -f $trustTxt)
     Write-Host ("客户端      : {0}" -f $clTxt)
     Write-Host ("网络连通    : {0}" -f $(if ($on) { '在线' } else { '离线' }))
@@ -928,6 +1023,9 @@ Write-Log ("===== 守护启动（{0}）=====" -f $(if ($IsDeployed) { '部署副
 Grant-LogRead
 if (-not $IsDeployed -and ((Test-PathAccessible (Join-Path $DeployDir 'TianyiAutoLogin.ps1')) -eq $true)) {
     Write-Log '注意：当前跑的是源码副本，正式部署副本在 ProgramData，两者可能不一致（改了源码请重新 -Install）'
+}
+if ($ClientPathSource -eq '自动探测（回退）') {
+    Write-Log ("注意：client-path.txt 里的路径下找不到客户端，已自动改用 {0}；建议更新该文件" -f $ClientDir)
 }
 if (Get-TrustState -eq 'none') { Write-Log '客户端哈希校验未启用' }
 
