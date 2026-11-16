@@ -376,30 +376,55 @@ function Start-ClientAndLogin {
 
 function Set-DeployDirAcl {
     param([string]$Dir)
+
     # 1) 先拿所有权。用 takeown /a 而不是 icacls /setowner：
     #    把所有者设成"Administrators 组"需要 SeRestorePrivilege，这个特权在提权进程里
     #    默认是关闭的，icacls 不会自己启用它 → /setowner 静默失败、退出码非 0。
     #    takeown 会自己启用所需特权，/a 表示把所有者给 Administrators 组。
-    $takeownOut = & takeown.exe /f $Dir /a /r /d y 2>&1 | Out-String
+    $ownerOut = & takeown.exe /f $Dir /a /r /d y 2>&1 | Out-String
     $ownerExit = $LASTEXITCODE
-    if ($ownerExit -ne 0) {
-        # 退一步：至少尝试直接设成 Administrators（万一 takeown 不可用）
-        $takeownOut += (& icacls.exe $Dir /setowner "*${AdminsSid}" /T /C 2>&1 | Out-String)
-        $ownerExit = $LASTEXITCODE
+
+    # 2) 修子对象：/reset 让它们重新从父目录继承。
+    #    这同时会清掉任何历史遗留的"显式"ACE（包括被人加的 Users:(F)）。
+    #    必须在 3) 之前做：先改父目录再 reset 孩子，孩子中间会短暂失去全部权限。
+    $childExit = 0
+    $childOut = ''
+    $children = @(Get-ChildItem -LiteralPath $Dir -Force -ErrorAction SilentlyContinue)
+    if ($children.Count -gt 0) {
+        $childOut = & icacls.exe (Join-Path $Dir '*') /reset /T /C 2>&1 | Out-String
+        $childExit = $LASTEXITCODE
     }
 
-    # 2) 断开继承 + 只留 SYSTEM 与 Administrators（含子对象）
-    $aclOut = & icacls.exe $Dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' "*${AdminsSid}:(OI)(CI)F" /T /C 2>&1 | Out-String
+    # 3) 父目录：断开继承 + 只留 SYSTEM 与 Administrators。
+    #    ⚠ 这里**绝对不能加 /T**。上一版写成 /inheritance:r /grant:r ... /T，
+    #    递归时父目录先断开继承，子文件瞬间变成"空 DACL"（谁都读写不了），
+    #    随后 icacls 也没法再给它们授权 —— 部署副本就这样被锁死，
+    #    表现为 Get-FileHash 读不到、Copy-Item 报"访问被拒绝"。
+    #    父目录加上 (OI)(CI) 的 ACE 后，子对象会自动继承，不需要递归。
+    $aclOut = & icacls.exe $Dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' "*${AdminsSid}:(OI)(CI)F" 2>&1 | Out-String
     $aclExit = $LASTEXITCODE
 
     # 失败时把命令输出的最后几行留下来，方便事后定位（提权窗口一闪就没）
     $detail = ''
-    if ($ownerExit -ne 0 -or $aclExit -ne 0) {
-        $lines = @(($takeownOut + $aclOut) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 4)
+    if ($ownerExit -ne 0 -or $childExit -ne 0 -or $aclExit -ne 0) {
+        $lines = @(($ownerOut + $childOut + $aclOut) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 4)
         $detail = ' :: ' + ($lines -join ' / ')
     }
-    $script:AclDiag = ('takeown/owner exit={0}, icacls exit={1}{2}' -f $ownerExit, $aclExit, $detail)
+    $script:AclDiag = ('takeown={0}, childReset={1}, icacls={2}{3}' -f $ownerExit, $childExit, $aclExit, $detail)
     return ($ownerExit -eq 0 -and $aclExit -eq 0)
+}
+
+# 目标文件可能还带着上一次留下的坏 ACL（空 DACL / 拒绝写），直接覆盖会"访问被拒绝"。
+# 先删再建最稳：删除走父目录的 DELETE_CHILD 权限，不受文件自身 DACL 限制。
+function Remove-FileIfExists([string]$Path) {
+    if (-not [IO.File]::Exists($Path)) { return $true }
+    try {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Write-InstallLog ("提示：删除旧文件失败（{0}）：{1}" -f $Path, $_.Exception.Message)
+        return $false
+    }
 }
 
 function Test-DeployDirAcl {
@@ -523,7 +548,9 @@ function Save-ClientHash([string]$dir) {
         return $false
     }
     $h = (Get-FileHash -Path $ClientExe -Algorithm SHA256).Hash
-    $h | Out-File (Join-Path $dir 'client-sha256.txt') -Encoding ASCII -Force
+    $hashPath = Join-Path $dir 'client-sha256.txt'
+    [void](Remove-FileIfExists $hashPath)      # 旧文件可能带着坏 ACL，先删再写
+    $h | Out-File $hashPath -Encoding ASCII -Force
     Write-Host "已记录客户端哈希：$h"
     return $true
 }
@@ -578,6 +605,25 @@ if ($Install) {
         exit 1
     }
     Write-InstallLog ("权限校验通过：所有者 {0}，无普通用户组写权限" -f $aclState.Owner)
+
+    # 功能自检：DACL 读起来正确 ≠ 真的能写。子对象 DACL 被清空、额外限制策略等
+    # 都会让"校验通过"但写不进去。这里真写一个探针文件，早报错比在复制时炸清楚。
+    $probe = Join-Path $DeployDir '.write-probe'
+    $canWrite = $false
+    try {
+        Set-Content -LiteralPath $probe -Value 'ok' -Encoding ASCII -ErrorAction Stop
+        $canWrite = $true
+    } catch {
+        Write-InstallLog ("  探针写入失败：{0}" -f $_.Exception.Message)
+    }
+    if ($canWrite) { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+    if (-not $canWrite) {
+        Write-InstallLog '安装中止：目录权限看起来正确，但管理员实际写不进去。'
+        Write-InstallLog ("  命令结果: {0}" -f $script:AclDiag)
+        Write-InstallLog '  常见原因：目录里有被抽空 DACL 的子对象，或安全软件拦截了对该目录的写入。'
+        exit 1
+    }
+    Write-InstallLog '写入自检通过'
     if ($dirExisted -and $oldOwner -and $oldOwner -ne $AdminsSid) {
         Write-InstallLog ("注意：部署目录原先的所有者是 {0}，已收回给 Administrators。" -f $oldOwner)
     }
@@ -589,6 +635,7 @@ if ($Install) {
     } catch { }
     if (-not $samePath) {
         Write-InstallLog ("复制脚本 -> {0}" -f $dstPs1)
+        [void](Remove-FileIfExists $dstPs1)
         try {
             Copy-Item -LiteralPath $PSCommandPath -Destination $dstPs1 -Force -ErrorAction Stop
         } catch {
@@ -644,6 +691,7 @@ if ($Install) {
     }
 
     # 4) 客户端路径：把当前解析到的路径写进部署目录（部署后没有它就会退回默认值）
+    [void](Remove-FileIfExists $dstCfg)
     $ClientDir | Out-File $dstCfg -Encoding UTF8 -Force
 
     # 5) 记录客户端哈希，作为后续启动前的校验基准
@@ -651,6 +699,7 @@ if ($Install) {
 
     # 6) 生成隐藏运行的 VBS 启动器（wscript 按 ANSI 读，必须用 Default 编码写）
     #    第三个参数 False = 不等待，wscript 立刻退出、PowerShell 守护进程留在后台
+    [void](Remove-FileIfExists $dstVbs)
     $vbsLines = @(
         'Set ws = CreateObject("WScript.Shell")'
         'ws.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""' + $dstPs1 + '""", 0, False'
