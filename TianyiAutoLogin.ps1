@@ -88,6 +88,18 @@ function Test-PathAccessible([string]$Path) {
     } catch { return $null }
 }
 
+# -Install 通常是从普通窗口触发提权的：它跑在**另一个**控制台窗口里，出错一闪就关，
+# 用户根本看不到原因。所以安装过程同时写一份日志到 ProgramData 根目录（那里 Users
+# 有读权限），失败后可以直接打开看。
+$script:InstallLog = Join-Path $ProgramDataRoot 'TianyiAutoLogin-install.log'
+$script:AclDiag = ''
+function Write-InstallLog([string]$msg) {
+    Write-Host $msg
+    try {
+        Add-Content -LiteralPath $script:InstallLog -Value ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg) -Encoding UTF8 -ErrorAction Stop
+    } catch { }
+}
+
 # 当前跑的是部署副本还是仓库里的开发副本
 $IsDeployed = $false
 try {
@@ -364,12 +376,29 @@ function Start-ClientAndLogin {
 
 function Set-DeployDirAcl {
     param([string]$Dir)
-    # 1) 抢所有权（含子对象）；/C 忽略个别对象的错误，最后看退出码
-    & icacls.exe $Dir /setowner "*${AdminsSid}" /T /C *> $null
+    # 1) 先拿所有权。用 takeown /a 而不是 icacls /setowner：
+    #    把所有者设成"Administrators 组"需要 SeRestorePrivilege，这个特权在提权进程里
+    #    默认是关闭的，icacls 不会自己启用它 → /setowner 静默失败、退出码非 0。
+    #    takeown 会自己启用所需特权，/a 表示把所有者给 Administrators 组。
+    $takeownOut = & takeown.exe /f $Dir /a /r /d y 2>&1 | Out-String
     $ownerExit = $LASTEXITCODE
+    if ($ownerExit -ne 0) {
+        # 退一步：至少尝试直接设成 Administrators（万一 takeown 不可用）
+        $takeownOut += (& icacls.exe $Dir /setowner "*${AdminsSid}" /T /C 2>&1 | Out-String)
+        $ownerExit = $LASTEXITCODE
+    }
+
     # 2) 断开继承 + 只留 SYSTEM 与 Administrators（含子对象）
-    & icacls.exe $Dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' "*${AdminsSid}:(OI)(CI)F" /T /C *> $null
+    $aclOut = & icacls.exe $Dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' "*${AdminsSid}:(OI)(CI)F" /T /C 2>&1 | Out-String
     $aclExit = $LASTEXITCODE
+
+    # 失败时把命令输出的最后几行留下来，方便事后定位（提权窗口一闪就没）
+    $detail = ''
+    if ($ownerExit -ne 0 -or $aclExit -ne 0) {
+        $lines = @(($takeownOut + $aclOut) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 4)
+        $detail = ' :: ' + ($lines -join ' / ')
+    }
+    $script:AclDiag = ('takeown/owner exit={0}, icacls exit={1}{2}' -f $ownerExit, $aclExit, $detail)
     return ($ownerExit -eq 0 -and $aclExit -eq 0)
 }
 
@@ -502,10 +531,20 @@ function Save-ClientHash([string]$dir) {
 if ($Install) {
     # 客户端以管理员权限运行，安装步骤也需提权，保证后续排错时权限一致
     if (-not (Test-Admin)) {
-        Invoke-Elevate '-Install'
+        try { Invoke-Elevate '-Install' }
+        catch {
+            Write-Host ("提权失败（UAC 被取消？）：{0}" -f $_.Exception.Message)
+            Write-Host '未做任何改动。重新运行并允许管理员权限即可。'
+            exit 1
+        }
         Write-Host '请在弹出的 UAC 窗口中确认，以完成安装。'
+        Write-Host ("安装过程会记录到：{0}" -f $script:InstallLog)
+        Write-Host '（提权窗口一闪而过时，用记事本打开上面这个文件看失败原因）'
         exit 0
     }
+
+    Write-InstallLog '===== -Install 开始（已提权）====='
+    Write-InstallLog ("部署目录: {0}" -f $DeployDir)
 
     $dstPs1  = Join-Path $DeployDir 'TianyiAutoLogin.ps1'
     $dstVbs  = Join-Path $DeployDir '天翼校园自动登录.vbs'
@@ -516,27 +555,31 @@ if ($Install) {
     $oldOwner = ''
     if ($dirExisted) {
         try { $oldOwner = (Get-Acl -LiteralPath $DeployDir -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+        Write-InstallLog ("目录已存在，原所有者: {0}" -f $(if ($oldOwner) { $oldOwner } else { '读取失败' }))
     } else {
         New-Item -ItemType Directory -Path $DeployDir -Force | Out-Null
+        Write-InstallLog '目录不存在，已新建'
     }
 
     # 2) 抢所有权 + 收紧 ACL，然后**回读校验**；锁不住就中止，不注册最高权限任务
     [void](Set-DeployDirAcl $DeployDir)
     $aclState = Test-DeployDirAcl $DeployDir
     if (-not $aclState.Ok) {
-        Write-Host ''
-        Write-Host '安装中止：部署目录权限没有锁住，不能带着这个状态注册最高权限计划任务。'
-        Write-Host ("  目录      : {0}" -f $DeployDir)
-        Write-Host ("  当前属主  : {0}（期望 {1} = Administrators）" -f $aclState.Owner, $AdminsSid)
+        Write-InstallLog ''
+        Write-InstallLog '安装中止：部署目录权限没有锁住，不能带着这个状态注册最高权限计划任务。'
+        Write-InstallLog ("  目录      : {0}" -f $DeployDir)
+        Write-InstallLog ("  当前属主  : {0}（期望 {1} = Administrators）" -f $aclState.Owner, $AdminsSid)
+        Write-InstallLog ("  命令结果  : {0}" -f $script:AclDiag)
         if ($aclState.Weak.Count -gt 0) {
-            Write-Host ("  残留弱权限: {0}" -f ($aclState.Weak -join '; '))
+            Write-InstallLog ("  残留弱权限: {0}" -f ($aclState.Weak -join '; '))
         }
-        Write-Host '  处理办法：以管理员身份打开该目录属性 -> 安全 -> 高级，把所有者改成'
-        Write-Host '  Administrators 并移除普通用户的写权限，然后重新执行 -Install。'
+        Write-InstallLog '  处理办法：以管理员身份打开该目录属性 -> 安全 -> 高级，把所有者改成'
+        Write-InstallLog '  Administrators 并移除普通用户的写权限，然后重新执行 -Install。'
         exit 1
     }
+    Write-InstallLog ("权限校验通过：所有者 {0}，无普通用户组写权限" -f $aclState.Owner)
     if ($dirExisted -and $oldOwner -and $oldOwner -ne $AdminsSid) {
-        Write-Host ("注意：部署目录原先的所有者是 {0}，已收回给 Administrators。" -f $oldOwner)
+        Write-InstallLog ("注意：部署目录原先的所有者是 {0}，已收回给 Administrators。" -f $oldOwner)
     }
 
     # 3) 部署脚本本体，并立刻比对哈希（防止半写/截断的副本被计划任务执行）
@@ -549,9 +592,10 @@ if ($Install) {
         $srcHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
         $dstHash = (Get-FileHash -LiteralPath $dstPs1 -Algorithm SHA256).Hash
         if ($srcHash -ne $dstHash) {
-            Write-Host ("安装中止：脚本复制后校验不一致（源 {0} / 部署 {1}）。" -f $srcHash, $dstHash)
+            Write-InstallLog ("安装中止：脚本复制后校验不一致（源 {0} / 部署 {1}）。" -f $srcHash, $dstHash)
             exit 1
         }
+        Write-InstallLog '脚本副本已写入并校验一致'
     }
 
     # 4) 客户端路径：把当前解析到的路径写进部署目录（部署后没有它就会退回默认值）
@@ -573,8 +617,9 @@ if ($Install) {
         $tr = 'wscript.exe "' + $dstVbs + '"'
         & schtasks.exe /Create /TN $TaskName /TR $tr /SC ONLOGON /RL HIGHEST /F *> $null
         if ($LASTEXITCODE -ne 0) { throw "schtasks create exit code $LASTEXITCODE" }
+        Write-InstallLog '计划任务已注册'
     } catch {
-        Write-Host "安装失败：$($_.Exception.Message)"
+        Write-InstallLog "安装失败：$($_.Exception.Message)"
         exit 1
     }
 
@@ -586,18 +631,18 @@ if ($Install) {
         }
     }
 
-    Write-Host ("安装完成：`n  部署目录: {0}（所有者 Administrators，仅 SYSTEM/Administrators 可写）`n  脚本副本: {1}`n  计划任务: {2}（登录时自动运行，已在后台启动）`n  日志位置: {3}" -f $DeployDir, $dstPs1, $TaskName, (Join-Path $DeployDir 'autologin.log'))
+    Write-InstallLog ("安装完成：`n  部署目录: {0}（所有者 Administrators，仅 SYSTEM/Administrators 可写）`n  脚本副本: {1}`n  计划任务: {2}（登录时自动运行，已在后台启动）`n  日志位置: {3}" -f $DeployDir, $dstPs1, $TaskName, (Join-Path $DeployDir 'autologin.log'))
 
     # 9) 客户端自带的开机自启会跟计划任务撞车，装完顺手报一下
     $autostart = @(Get-ClientAutostart)
     if ($autostart.Count -gt 0) {
-        Write-Host ''
-        Write-Host '提示：客户端自带开机自启，登录时会和本计划任务同时拉起同一客户端：'
+        Write-InstallLog ''
+        Write-InstallLog '提示：客户端自带开机自启，登录时会和本计划任务同时拉起同一客户端：'
         foreach ($a in $autostart) {
             $tail = if ($a.Exists) { '' } else { '（目标不存在，死项，可以删）' }
-            Write-Host ("  [{0}] {1} = {2}{3}" -f $a.Name, $a.Key, $a.Value, $tail)
+            Write-InstallLog ("  [{0}] {1} = {2}{3}" -f $a.Name, $a.Key, $a.Value, $tail)
         }
-        Write-Host '  守护只在「进程不存在」时才拉起，一般不会双开；遇到双开/抢窗口就在客户端设置里关掉自启。'
+        Write-InstallLog '  守护只在「进程不存在」时才拉起，一般不会双开；遇到双开/抢窗口就在客户端设置里关掉自启。'
     }
 
     # 10) 立即拉起来跑一遍，不用等下次登录
@@ -605,17 +650,23 @@ if ($Install) {
     # 不停掉的话，新守护抢不到互斥量会直接 exit 0，等于没换上。
     $killed = Stop-DaemonProcesses
     if ($killed.Count -gt 0) {
-        Write-Host ("已停止旧守护进程：{0}" -f ($killed -join ', '))
+        Write-InstallLog ("已停止旧守护进程：{0}" -f ($killed -join ', '))
         Start-Sleep -Seconds 2
     }
     try { & schtasks.exe /Run /TN $TaskName *> $null } catch { }
+    Write-InstallLog '已触发计划任务，守护进程应在数秒内启动'
     exit 0
 }
 
 if ($TrustClient) {
     if (-not (Test-Admin)) {
-        Invoke-Elevate '-TrustClient'
+        try { Invoke-Elevate '-TrustClient' }
+        catch {
+            Write-Host ("提权失败（UAC 被取消？）：{0}" -f $_.Exception.Message)
+            exit 1
+        }
         Write-Host '请在弹出的 UAC 窗口中确认。'
+        Write-Host ("过程会记录到：{0}" -f $script:InstallLog)
         exit 0
     }
     $target = $DeployDir
@@ -627,7 +678,7 @@ if ($TrustClient) {
     [void](Set-DeployDirAcl $target)
     $aclState = Test-DeployDirAcl $target
     if (-not $aclState.Ok) {
-        Write-Host ("失败：{0} 的权限未锁住（属主 {1}），写入的哈希基准不可信。先修目录权限再重试。" -f $target, $aclState.Owner)
+        Write-Host ("失败：{0} 的权限未锁住（属主 {1}；{2}），写入的哈希基准不可信。先修目录权限再重试。" -f $target, $aclState.Owner, $script:AclDiag)
         exit 1
     }
     [void](Save-ClientHash $target)
