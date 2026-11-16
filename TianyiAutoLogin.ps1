@@ -101,6 +101,13 @@ function Rotate-Log {
     }
 }
 
+# 只给 Users 读权限：不提升权限也能看日志，但拿不到写权限，篡改不了。
+# 部署目录本身仍然只有 SYSTEM + Administrators 可写。
+function Grant-LogRead {
+    if (-not (Test-Path $LogFile)) { return }
+    try { & icacls.exe $LogFile /grant '*S-1-5-32-545:R' *> $null } catch { }
+}
+
 # ---------- 客户端完整性校验 ----------
 # 把哈希文件放在受 ACL 保护的部署目录里才有意义：普通用户改不了基准值。
 $script:lastTrustLog = [datetime]::MinValue
@@ -195,6 +202,9 @@ function Initialize-Win32 {
         Add-Type -Name 'TyWin32' -Namespace 'Ty' -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hWnd);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr WindowFromPoint(POINT p);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetAncestor(System.IntPtr hWnd, uint gaFlags);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetWindowPos(System.IntPtr hWnd, System.IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
@@ -228,14 +238,11 @@ function Invoke-LoginClick {
     if ($h -eq 0) { return $false }
 
     [void][Ty.TyWin32]::ShowWindow($h, 9)              # SW_RESTORE，最小化也能点
+    # 尽力抢前台；被系统前台锁定拒绝也无所谓，后面按坐标判定，不依赖它
     [void][Ty.TyWin32]::SetForegroundWindow($h)
+    # 只抬 z 序、不激活：SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+    [void][Ty.TyWin32]::SetWindowPos($h, [IntPtr]::Zero, 0, 0, 0, 0, 0x13)
     Start-Sleep -Milliseconds 400
-
-    # 抢前台可能被系统拒绝（前台锁定等），没抢到就不点，避免点到别的窗口
-    if ([Ty.TyWin32]::GetForegroundWindow() -ne $h) {
-        Write-Log '窗口未切到前台，跳过本次点击'
-        return $false
-    }
 
     $rect = New-Object 'Ty.TyWin32+RECT'
     if (-not [Ty.TyWin32]::GetClientRect($h, [ref]$rect)) { return $false }
@@ -246,9 +253,13 @@ function Invoke-LoginClick {
     $pt.Y = [int]($rect.Bottom * $LoginPointY)
     [void][Ty.TyWin32]::ClientToScreen($h, [ref]$pt)
 
-    # 算坐标到真正点击之间还有几十毫秒，再确认一次前台没被抢走
-    if ([Ty.TyWin32]::GetForegroundWindow() -ne $h) {
-        Write-Log '点击前前台窗口已变化，已取消本次点击'
+    # 关键校验：要点的那个屏幕坐标上，最顶层窗口必须是客户端窗口（或它的子窗口）。
+    # 不能拿「客户端是不是前台」当判据 —— 后台进程抢前台常被系统的前台锁定拒绝，
+    # 那样会永远判定失败、一次都点不出去，自动登录就彻底失效了。
+    $hit  = [Ty.TyWin32]::WindowFromPoint($pt)
+    $root = [Ty.TyWin32]::GetAncestor($hit, 2)          # GA_ROOT
+    if ($root -ne $h) {
+        Write-Log ("点击坐标处不是客户端窗口（hit={0} root={1}），跳过本次点击" -f $hit, $root)
         return $false
     }
 
@@ -492,6 +503,18 @@ if ($DryRun) {
     Write-Host ("客户端      : {0}" -f $clTxt)
     Write-Host ("网络连通    : {0}" -f $(if ($on) { '在线' } else { '离线' }))
     Write-Host ("掉线判定    : 连续 {0} 次探测失败（约 {1} 秒）" -f $OfflineSamples, ($OfflineSamples * $PollSec))
+
+    # 部署副本的日志才有诊断价值（仓库目录那份是开发模式留下的）
+    $deployLog = Join-Path $DeployDir 'autologin.log'
+    if (Test-Path $deployLog) {
+        Write-Host ''
+        Write-Host '--- 部署副本最近日志 ---'
+        try {
+            Get-Content $deployLog -Tail 12 -Encoding UTF8 -ErrorAction Stop | ForEach-Object { Write-Host ('  ' + $_) }
+        } catch {
+            Write-Host '  （当前权限读不到，需管理员）'
+        }
+    }
     exit 0
 }
 
@@ -513,6 +536,7 @@ $PID | Out-File $PidFile -Encoding ASCII -Force
 
 Rotate-Log
 Write-Log ("===== 守护启动（{0}）=====" -f $(if ($IsDeployed) { '部署副本' } else { '开发副本' }))
+Grant-LogRead
 if (Get-TrustState -eq 'none') { Write-Log '客户端哈希校验未启用' }
 
 $lastStart    = [datetime]::MinValue
