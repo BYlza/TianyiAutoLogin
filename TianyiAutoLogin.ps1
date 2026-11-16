@@ -588,14 +588,59 @@ if ($Install) {
         $samePath = [string]::Equals([IO.Path]::GetFullPath($PSCommandPath), [IO.Path]::GetFullPath($dstPs1), [StringComparison]::OrdinalIgnoreCase)
     } catch { }
     if (-not $samePath) {
-        Copy-Item -LiteralPath $PSCommandPath -Destination $dstPs1 -Force
-        $srcHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
-        $dstHash = (Get-FileHash -LiteralPath $dstPs1 -Algorithm SHA256).Hash
-        if ($srcHash -ne $dstHash) {
-            Write-InstallLog ("安装中止：脚本复制后校验不一致（源 {0} / 部署 {1}）。" -f $srcHash, $dstHash)
+        Write-InstallLog ("复制脚本 -> {0}" -f $dstPs1)
+        try {
+            Copy-Item -LiteralPath $PSCommandPath -Destination $dstPs1 -Force -ErrorAction Stop
+        } catch {
+            Write-InstallLog ("安装中止：复制脚本失败：{0}" -f $_.Exception.Message)
             exit 1
         }
-        Write-InstallLog '脚本副本已写入并校验一致'
+
+        # 复制后立刻确认目标还在。杀软把它当可疑文件隔离掉时，这里会是 False。
+        $existsNow = [IO.File]::Exists($dstPs1)
+        $sizeNow = -1
+        if ($existsNow) { try { $sizeNow = ([IO.FileInfo]$dstPs1).Length } catch { } }
+        Write-InstallLog ("复制完成：目标存在={0} 大小={1} 字节" -f $existsNow, $sizeNow)
+
+        # 刚写下去的文件可能正被杀软实时扫描占用，这时 Get-FileHash 会抛
+        # sharing violation、返回空哈希（本次安装就是栽在这里）。重试几次；
+        # 实在读不到就退回"比大小"——我们的目标是防止半写/截断，不是防并发攻击。
+        $srcHash = $null
+        $dstHash = $null
+        for ($i = 1; $i -le 5; $i++) {
+            try {
+                $h1 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256 -ErrorAction Stop).Hash
+                $h2 = (Get-FileHash -LiteralPath $dstPs1 -Algorithm SHA256 -ErrorAction Stop).Hash
+                $srcHash = $h1
+                $dstHash = $h2
+                break
+            } catch {
+                if ($i -lt 5) { Start-Sleep -Milliseconds 400 }
+                else { Write-InstallLog ("哈希读不到（{0}），改用文件大小比对" -f $_.Exception.Message) }
+            }
+        }
+
+        if ($srcHash -and $dstHash) {
+            if ($srcHash -ne $dstHash) {
+                Write-InstallLog ("安装中止：脚本复制后校验不一致（源 {0} / 部署 {1}）。" -f $srcHash, $dstHash)
+                exit 1
+            }
+            Write-InstallLog ("脚本副本已写入并校验一致（{0}）" -f $srcHash)
+        } else {
+            $lenSrc = 0
+            $lenDst = -1
+            try { $lenSrc = ([IO.FileInfo]$PSCommandPath).Length } catch { }
+            if ([IO.File]::Exists($dstPs1)) { try { $lenDst = ([IO.FileInfo]$dstPs1).Length } catch { } }
+            if ($lenSrc -ne $lenDst) {
+                Write-InstallLog ("安装中止：脚本副本大小不一致（源 {0} 字节 / 部署 {1} 字节，-1 表示不存在）。" -f $lenSrc, $lenDst)
+                if ($lenDst -eq -1) {
+                    Write-InstallLog '  目标文件在复制后消失了——通常是安全软件（火绒/Defender）把它隔离了。'
+                    Write-InstallLog '  把 C:\ProgramData\TianyiAutoLogin 和本脚本加入白名单/排除项后重试。'
+                }
+                exit 1
+            }
+            Write-InstallLog ("脚本副本已写入（大小一致 {0} 字节；哈希读不到，已跳过内容比对）" -f $lenSrc)
+        }
     }
 
     # 4) 客户端路径：把当前解析到的路径写进部署目录（部署后没有它就会退回默认值）
