@@ -8,7 +8,10 @@
 #     "已经断网" 时才重启客户端，绝不会在正常在线时去动它。
 #   * Config\ConnectSetting.ini 的 connState 是残留值（进程已消失时仍可能是 1），
 #     不能当在线判据；一律以真实连通性（ping / TCP）为准。
-#   * 客户端没有任何开机自启项，开机必须由本脚本拉起。
+#   * 客户端通常自带开机自启（HKLM\SOFTWARE\WOW6432Node\...\Run 里的
+#     "Esurfing Client in Campus"）。登录时会和本脚本的计划任务同时拉起同一客户端；
+#     守护只在"进程不存在"时才动手，正常情况下不会双开。-Install / -DryRun 会把
+#     这类自启项列出来，真撞上了就在客户端设置里关掉。
 #   * 客户端被拉起后如果停在登录页不会自己拨号，脚本会自动点一次「登录」按钮。
 #     该界面是内嵌网页（窗口类 wkeWebWindow），没有控件树，只能按客户区相对坐标点击。
 #   * 脚本常驻运行（不退出），平时不写日志、不弹窗；只在状态变化时记一行。
@@ -18,10 +21,19 @@
 #     收紧为「仅 SYSTEM + Administrators」，去掉普通用户的写权限。
 #     计划任务以最高权限运行；若脚本留在用户可写目录，任何用户态程序都能改写它，
 #     从而在下次登录时静默拿到管理员权限。
+#   * 部署目录的路径**不读 %ProgramData% 环境变量**：提权进程会继承调用者的环境块，
+#     普通用户可以用 setx 把它指向自己完全控制的目录。这里改用注册表里的
+#     CommonApplicationData 真实路径。
+#   * 收紧 ACL 之前先 icacls /setowner 把所有者换成 Administrators。Windows 里
+#     「属主」隐式拥有 READ_CONTROL + WRITE_DAC，只改 DACL 不换属主的话，抢在安装前
+#     建出同名目录的人（C:\ProgramData 默认允许 Users 建子目录）可以把自己加回来。
+#   * 权限校验不通过就中止安装，绝不会带着「没锁住」的状态去注册最高权限任务。
 #   * -Install 同时把客户端 exe 的 SHA256 记进 client-sha256.txt。此后每次启动客户端
 #     前都会校验，不匹配就拒绝启动（防止客户端被替换后以管理员权限执行任意程序）。
 #     官方升级客户端后，重新执行一次 -TrustClient 记录新哈希。
-#   * 自动点击前会校验前台窗口确实是客户端窗口，不匹配就放弃本次点击。
+#   * -Install 复制脚本后会立刻比对源与部署副本的哈希，防止半写/截断的副本被计划任务执行。
+#   * 自动点击前会校验点击坐标上最顶层的窗口确实是客户端（WindowFromPoint），
+#     不匹配就放弃本次点击；锁屏（LogonUI 在跑）直接跳过。
 #
 # 用法：
 #   部署 + 开机自启： powershell -ExecutionPolicy Bypass -File TianyiAutoLogin.ps1 -Install
@@ -41,13 +53,39 @@ $ErrorActionPreference = 'Continue'
 
 # ---------- 路径 ----------
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$DeployDir  = Join-Path $env:ProgramData 'TianyiAutoLogin'
+
+# 不要用 $env:ProgramData。提权时子进程继承调用者的环境块，普通用户可以
+# `setx ProgramData D:\某处` 把它指到自己完全控制的位置 —— 那样"受保护目录"
+# 的父目录可被整体替换，ACL 再严也没意义。改读注册表里的真实路径。
+$ProgramDataRoot = $null
+try { $ProgramDataRoot = [Environment]::GetFolderPath('CommonApplicationData') } catch { }
+if (-not $ProgramDataRoot) { $ProgramDataRoot = Join-Path $env:SystemDrive 'ProgramData' }
+
+$DeployDir  = Join-Path $ProgramDataRoot 'TianyiAutoLogin'
 $TaskName   = 'TianyiAutoLogin'
 $MutexName  = 'Global\TianyiAutoLoginWatchdog'
+$AdminsSid  = 'S-1-5-32-544'   # BUILTIN\Administrators
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     return (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# 判断"存在/不存在/存在但看不见"。不能用 Test-Path：它会为通配符解析去列举父目录，
+# 父目录 ACL 一收紧就抛 AccessDenied —— 但里面的文件本身可能是可读的（部署目录就
+# 单独给日志开了 Users:(R)）。这里改用 .NET 的属性检查，只在需要区分"没这个文件"
+# 和"看不见这个目录"时才去列举父目录。
+# 返回：存在 = $true / 不存在 = $false / 存在但当前权限看不见 = $null
+function Test-PathAccessible([string]$Path) {
+    try {
+        if ([System.IO.Directory]::Exists($Path) -or [System.IO.File]::Exists($Path)) { return $true }
+        $parent = [System.IO.Path]::GetDirectoryName($Path)
+        $leaf   = [System.IO.Path]::GetFileName($Path)
+        if (-not $parent -or -not [System.IO.Directory]::Exists($parent)) { return $false }
+        $hits = [System.IO.Directory]::GetFileSystemEntries($parent, $leaf)
+        if ($hits -and $hits.Count -gt 0) { return $true }
+        return $false
+    } catch { return $null }
 }
 
 # 当前跑的是部署副本还是仓库里的开发副本
@@ -70,8 +108,8 @@ $PidFile        = Join-Path $ScriptDir 'watchdog.pid'
 # 也可以不改脚本，直接在本脚本同目录新建 client-path.txt 写一行真实路径
 #（该文件已被 .gitignore 忽略，不会误提交）。
 $ClientDir = 'C:\Program Files (x86)\Chinatelecom\GDPortal'
-if (Test-Path $ClientPathFile) {
-    $rawCfg = Get-Content $ClientPathFile -Raw -ErrorAction SilentlyContinue
+if ((Test-PathAccessible $ClientPathFile) -eq $true) {
+    $rawCfg = Get-Content -LiteralPath $ClientPathFile -Raw -ErrorAction SilentlyContinue
     if ($rawCfg) {
         $rawCfg = $rawCfg.Trim().TrimStart([char]0xFEFF).Trim()
         if ($rawCfg) { $ClientDir = $rawCfg }
@@ -113,13 +151,27 @@ function Grant-LogRead {
 $script:lastTrustLog = [datetime]::MinValue
 
 function Get-TrustState {
-    # 返回：none（未配置） / ok / mismatch / missing
-    if (-not (Test-Path $ClientHashFile)) { return 'none' }
-    $want = Get-Content $ClientHashFile -Raw -ErrorAction SilentlyContinue
+    # 返回：none（未配置） / ok / mismatch / missing / denied（无权读基准）
+    # HashFile / Exe 可显式指定：-DryRun 从源码目录跑时要看**部署副本**的基准，
+    # 否则会误报"未配置"（基准只在 %ProgramData% 里）。
+    param([string]$HashFile, [string]$Exe)
+    if (-not $HashFile) { $HashFile = $ClientHashFile }
+    if (-not $Exe) { $Exe = $ClientExe }
+
+    $hasHash = Test-PathAccessible $HashFile
+    if ($null -eq $hasHash) { return 'denied' }
+    if (-not $hasHash) { return 'none' }
+
+    $want = $null
+    try { $want = Get-Content -LiteralPath $HashFile -Raw -ErrorAction Stop } catch { return 'denied' }
     if ($want) { $want = $want.Trim().TrimStart([char]0xFEFF).Trim() }
     if (-not $want) { return 'none' }
-    if (-not (Test-Path $ClientExe)) { return 'missing' }
-    try { $got = (Get-FileHash -Path $ClientExe -Algorithm SHA256 -ErrorAction Stop).Hash } catch { return 'missing' }
+
+    $hasExe = Test-PathAccessible $Exe
+    if ($null -eq $hasExe) { return 'denied' }
+    if (-not $hasExe) { return 'missing' }
+
+    try { $got = (Get-FileHash -Path $Exe -Algorithm SHA256 -ErrorAction Stop).Hash } catch { return 'missing' }
     if ($got -eq $want) { return 'ok' }
     return 'mismatch'
 }
@@ -301,9 +353,115 @@ function Start-ClientAndLogin {
     Write-Log '连续 5 次点击登录仍未联网，等人工处理'
 }
 
+# ---------- 部署目录权限 ----------
+# 为什么必须先抢所有权：Windows 里"属主"隐式拥有 READ_CONTROL + WRITE_DAC，不管
+# DACL 写成什么样，属主都能把自己重新加回完全控制。而 C:\ProgramData 默认给
+# BUILTIN\Users 的是 (CI)(AD,WD,WEA,WA)，普通用户**可以在这里建子目录**、并因
+# CREATOR OWNER 规则成为属主。于是存在这样一条路：抢先建出
+# C:\ProgramData\TianyiAutoLogin → 管理员 -Install 只改 DACL → 属主仍是攻击者
+# → 他把自己加回去 → 改写脚本 → 下次登录以管理员执行。
+# 所以：先 /setowner 换成 Administrators，再设 DACL，最后回读校验。
+
+function Set-DeployDirAcl {
+    param([string]$Dir)
+    # 1) 抢所有权（含子对象）；/C 忽略个别对象的错误，最后看退出码
+    & icacls.exe $Dir /setowner "*${AdminsSid}" /T /C *> $null
+    $ownerExit = $LASTEXITCODE
+    # 2) 断开继承 + 只留 SYSTEM 与 Administrators（含子对象）
+    & icacls.exe $Dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' "*${AdminsSid}:(OI)(CI)F" /T /C *> $null
+    $aclExit = $LASTEXITCODE
+    return ($ownerExit -eq 0 -and $aclExit -eq 0)
+}
+
+function Test-DeployDirAcl {
+    # 回读校验：属主必须是 Administrators/SYSTEM，且没有给普通用户组任何"非只读"权限
+    param([string]$Dir)
+    $res = [pscustomobject]@{ Ok = $false; Owner = ''; Weak = @() }
+    try { $acl = Get-Acl -LiteralPath $Dir -ErrorAction Stop } catch { return $res }
+
+    try { $res.Owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value }
+    catch { $res.Owner = [string]$acl.Owner }
+
+    # 只读权限的组合：读数据/读属性/读权限/同步/列目录/执行
+    $readOnly = [int][System.Security.AccessControl.FileSystemRights]'Read, ReadAndExecute, ReadData, ReadAttributes, ReadExtendedAttributes, ReadPermissions, Synchronize, ListDirectory, ExecuteFile, Traverse'
+    $weakSids = @('S-1-5-32-545', 'S-1-5-11', 'S-1-1-0', 'S-1-5-32-546', 'S-1-5-32-547', 'S-1-3-0')  # Users / Authenticated Users / Everyone / Guests / Power Users / CREATOR OWNER
+
+    foreach ($ace in $acl.Access) {
+        if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+        $sid = ''
+        try { $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
+        catch { $sid = [string]$ace.IdentityReference }
+        if ($weakSids -notcontains $sid) { continue }
+        if ((([int]$ace.FileSystemRights) -band (-bnot $readOnly)) -ne 0) {
+            $res.Weak += ('{0}:{1}' -f $sid, $ace.FileSystemRights)
+        }
+    }
+
+    $ownerOk = ($res.Owner -eq $AdminsSid)
+    $res.Ok = ($ownerOk -and $res.Weak.Count -eq 0)
+    return $res
+}
+
+# ---------- 客户端自带的开机自启 ----------
+# 客户端装完通常会在 HKLM 的 Run 里留一项，登录时和本脚本的计划任务同时拉起。
+# 守护只在"进程不存在"时才动手，所以一般不会双开；但要把这件事说清楚，别让
+# "客户端没有自启"这个错误前提继续写进注释和 README。
+function Get-ClientAutostart {
+    $found = @()
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+    )
+    foreach ($k in $keys) {
+        $props = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
+        if (-not $props) { continue }
+        foreach ($p in $props.PSObject.Properties) {
+            if ($p.Name -like 'PS*') { continue }
+            $val = [string]$p.Value
+            if ($val -notmatch 'ESurfing|GDPortal|JSPortal|AutoStart\.exe') { continue }
+            $exe = $val.Trim()
+            if ($exe.StartsWith('"')) {
+                $end = $exe.IndexOf('"', 1)
+                if ($end -gt 1) { $exe = $exe.Substring(1, $end - 1) }
+            } else {
+                $exe = ($exe -split ' ')[0]
+            }
+            $exeExists = $false
+            if ($exe) { $exeExists = [bool](Test-Path -LiteralPath $exe -ErrorAction SilentlyContinue) }
+            $found += [pscustomobject]@{
+                Key    = $k
+                Name   = $p.Name
+                Value  = $val
+                Exists = $exeExists
+            }
+        }
+    }
+    return $found
+}
+
+# ---------- 源码副本 vs 部署副本 ----------
+# -Install 是单向复制，之后改源码不会同步。没有这个检查，"以为部署了、其实跑的是
+# 旧版"就会静默发生（上一轮那个点击判定失效就是这么来的）。
+function Get-DeployDrift {
+    $dst = Join-Path $DeployDir 'TianyiAutoLogin.ps1'
+    $hasDst = Test-PathAccessible $dst
+    if ($null -eq $hasDst) { return 'unreadable' }   # 目录存在但没权限（普通用户）
+    if (-not $hasDst) { return 'none' }
+    try {
+        $srcHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        $dstHash = (Get-FileHash -LiteralPath $dst -Algorithm SHA256 -ErrorAction Stop).Hash
+    } catch { return 'unreadable' }
+    if ($srcHash -eq $dstHash) { return 'same' }
+    return 'drift'
+}
+
 # ---------- 部署 / 卸载 ----------
 function Invoke-Elevate {
     param([string]$Switch)
+    # -NoProfile 是必须的：不加的话提权进程会先加载当前用户的 $PROFILE
+    # （Documents\WindowsPowerShell\profile.ps1，普通用户可写），
+    # 任何用户态程序往那儿写几行，代码就会在管理员进程里执行。
     Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",$Switch
 }
 
@@ -353,24 +511,47 @@ if ($Install) {
     $dstVbs  = Join-Path $DeployDir '天翼校园自动登录.vbs'
     $dstCfg  = Join-Path $DeployDir 'client-path.txt'
 
-    # 1) 建部署目录
-    if (-not (Test-Path $DeployDir)) {
+    # 1) 建部署目录；先记下"装之前是什么状态"，用于判断有没有被人抢建
+    $dirExisted = Test-Path $DeployDir
+    $oldOwner = ''
+    if ($dirExisted) {
+        try { $oldOwner = (Get-Acl -LiteralPath $DeployDir -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+    } else {
         New-Item -ItemType Directory -Path $DeployDir -Force | Out-Null
     }
 
-    # 2) 收紧 ACL：断开继承，只留 SYSTEM 与 Administrators（用 SID，避免中文系统组名问题）
-    $aclOk = $false
-    try {
-        & icacls.exe $DeployDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' *> $null
-        $aclOk = ($LASTEXITCODE -eq 0)
-    } catch { }
-    if (-not $aclOk) {
-        Write-Host "⚠ ACL 收紧失败。脚本仍会被提权运行，建议手动检查 $DeployDir 的权限，确保普通用户不可写。"
+    # 2) 抢所有权 + 收紧 ACL，然后**回读校验**；锁不住就中止，不注册最高权限任务
+    [void](Set-DeployDirAcl $DeployDir)
+    $aclState = Test-DeployDirAcl $DeployDir
+    if (-not $aclState.Ok) {
+        Write-Host ''
+        Write-Host '安装中止：部署目录权限没有锁住，不能带着这个状态注册最高权限计划任务。'
+        Write-Host ("  目录      : {0}" -f $DeployDir)
+        Write-Host ("  当前属主  : {0}（期望 {1} = Administrators）" -f $aclState.Owner, $AdminsSid)
+        if ($aclState.Weak.Count -gt 0) {
+            Write-Host ("  残留弱权限: {0}" -f ($aclState.Weak -join '; '))
+        }
+        Write-Host '  处理办法：以管理员身份打开该目录属性 -> 安全 -> 高级，把所有者改成'
+        Write-Host '  Administrators 并移除普通用户的写权限，然后重新执行 -Install。'
+        exit 1
+    }
+    if ($dirExisted -and $oldOwner -and $oldOwner -ne $AdminsSid) {
+        Write-Host ("注意：部署目录原先的所有者是 {0}，已收回给 Administrators。" -f $oldOwner)
     }
 
-    # 3) 部署脚本本体
-    if (-not [string]::Equals([IO.Path]::GetFullPath($PSCommandPath), [IO.Path]::GetFullPath($dstPs1), [StringComparison]::OrdinalIgnoreCase)) {
+    # 3) 部署脚本本体，并立刻比对哈希（防止半写/截断的副本被计划任务执行）
+    $samePath = $false
+    try {
+        $samePath = [string]::Equals([IO.Path]::GetFullPath($PSCommandPath), [IO.Path]::GetFullPath($dstPs1), [StringComparison]::OrdinalIgnoreCase)
+    } catch { }
+    if (-not $samePath) {
         Copy-Item -LiteralPath $PSCommandPath -Destination $dstPs1 -Force
+        $srcHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+        $dstHash = (Get-FileHash -LiteralPath $dstPs1 -Algorithm SHA256).Hash
+        if ($srcHash -ne $dstHash) {
+            Write-Host ("安装中止：脚本复制后校验不一致（源 {0} / 部署 {1}）。" -f $srcHash, $dstHash)
+            exit 1
+        }
     }
 
     # 4) 客户端路径：把当前解析到的路径写进部署目录（部署后没有它就会退回默认值）
@@ -405,9 +586,21 @@ if ($Install) {
         }
     }
 
-    Write-Host ("安装完成：`n  部署目录: {0}`n  脚本副本: {1}`n  计划任务: {2}（登录时自动运行，已在后台启动）`n  日志位置: {3}" -f $DeployDir, $dstPs1, $TaskName, (Join-Path $DeployDir 'autologin.log'))
+    Write-Host ("安装完成：`n  部署目录: {0}（所有者 Administrators，仅 SYSTEM/Administrators 可写）`n  脚本副本: {1}`n  计划任务: {2}（登录时自动运行，已在后台启动）`n  日志位置: {3}" -f $DeployDir, $dstPs1, $TaskName, (Join-Path $DeployDir 'autologin.log'))
 
-    # 立即拉起来跑一遍，不用等下次登录
+    # 9) 客户端自带的开机自启会跟计划任务撞车，装完顺手报一下
+    $autostart = @(Get-ClientAutostart)
+    if ($autostart.Count -gt 0) {
+        Write-Host ''
+        Write-Host '提示：客户端自带开机自启，登录时会和本计划任务同时拉起同一客户端：'
+        foreach ($a in $autostart) {
+            $tail = if ($a.Exists) { '' } else { '（目标不存在，死项，可以删）' }
+            Write-Host ("  [{0}] {1} = {2}{3}" -f $a.Name, $a.Key, $a.Value, $tail)
+        }
+        Write-Host '  守护只在「进程不存在」时才拉起，一般不会双开；遇到双开/抢窗口就在客户端设置里关掉自启。'
+    }
+
+    # 10) 立即拉起来跑一遍，不用等下次登录
     # 先停旧守护：它可能跑的是旧路径旧版本，还占着全局互斥量；
     # 不停掉的话，新守护抢不到互斥量会直接 exit 0，等于没换上。
     $killed = Stop-DaemonProcesses
@@ -426,7 +619,17 @@ if ($TrustClient) {
         exit 0
     }
     $target = $DeployDir
-    if (-not (Test-Path $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
+    if (-not (Test-Path $target)) {
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+    }
+    # 每次都重设一遍（幂等）：老版本装的目录可能只改了 DACL、属主还是普通用户，
+    # 这里顺手把它修好，而不是直接拒绝。
+    [void](Set-DeployDirAcl $target)
+    $aclState = Test-DeployDirAcl $target
+    if (-not $aclState.Ok) {
+        Write-Host ("失败：{0} 的权限未锁住（属主 {1}），写入的哈希基准不可信。先修目录权限再重试。" -f $target, $aclState.Owner)
+        exit 1
+    }
     [void](Save-ClientHash $target)
     Write-Host ("已更新信任的客户端哈希，位置：{0}" -f (Join-Path $target 'client-sha256.txt'))
     exit 0
@@ -480,12 +683,41 @@ if ($DryRun) {
     } else {
         '未运行（守护会拉起）'
     }
-    $trustTxt = switch (Get-TrustState) {
+
+    # 运行体已经迁到部署目录了。从源码目录跑自检时，客户端路径和哈希基准都必须
+    # 看**部署副本**，否则会拿源码目录里不存在的 client-sha256.txt 误报"未配置"。
+    $deployedPs1 = Join-Path $DeployDir 'TianyiAutoLogin.ps1'
+    # $true=存在 / $false=没有部署 / $null=存在但当前权限读不到
+    $deployProbe = Test-PathAccessible $deployedPs1
+    # 读不到时也要按"部署副本"来判，否则会退回源码目录、误报"哈希未配置"
+    $checkDir    = if ($deployProbe -eq $false) { $ScriptDir } else { $DeployDir }
+    $checkCfgFile  = Join-Path $checkDir 'client-path.txt'
+    $checkHashFile = Join-Path $checkDir 'client-sha256.txt'
+
+    $checkClientDir = $ClientDir
+    if ((Test-PathAccessible $checkCfgFile) -eq $true) {
+        $rawCfg = Get-Content -LiteralPath $checkCfgFile -Raw -ErrorAction SilentlyContinue
+        if ($rawCfg) {
+            $rawCfg = $rawCfg.Trim().TrimStart([char]0xFEFF).Trim()
+            if ($rawCfg) { $checkClientDir = $rawCfg }
+        }
+    }
+    $checkClientExe = Join-Path $checkClientDir 'ESurfingClient.exe'
+
+    $trustTxt = switch (Get-TrustState -HashFile $checkHashFile -Exe $checkClientExe) {
         'ok'       { '通过' }
         'none'     { '未配置（-Install 会生成）' }
         'mismatch' { '失败：客户端已变更，需 -TrustClient 重新信任' }
         'missing'  { '失败：客户端文件不存在' }
+        'denied'   { '读不到基准（用管理员运行 -DryRun 才能看）' }
         default    { '未知' }
+    }
+    $driftTxt = switch (Get-DeployDrift) {
+        'none'       { '无部署副本（-Install 会创建）' }
+        'same'       { '与源码一致' }
+        'drift'      { '不一致：改了源码但没重新 -Install，跑的还是旧版' }
+        'unreadable' { '读不到（用管理员运行 -DryRun 才能比对）' }
+        default      { '未知' }
     }
     $taskTxt = '未注册'
     try {
@@ -496,17 +728,29 @@ if ($DryRun) {
     }
 
     Write-Host ("脚本位置    : {0}{1}" -f $ScriptDir, $(if ($IsDeployed) { '（已部署，受 ACL 保护）' } else { '（开发副本，未部署）' }))
-    Write-Host ("部署目录    : {0}  {1}" -f $DeployDir, $(if (Test-Path $DeployDir) { '存在' } else { '不存在' }))
+    Write-Host ("部署目录    : {0}  {1}" -f $DeployDir, $(if ((Test-PathAccessible $DeployDir) -eq $true) { '存在' } else { '不存在' }))
+    Write-Host ("部署副本    : {0}" -f $driftTxt)
     Write-Host ("计划任务    : {0}  {1}" -f $TaskName, $taskTxt)
-    Write-Host ("客户端路径  : {0}  {1}" -f $ClientExe, $(if (Test-Path $ClientExe) { '存在' } else { '不存在' }))
+    Write-Host ("客户端路径  : {0}  {1}" -f $checkClientExe, $(if (Test-Path $checkClientExe) { '存在' } else { '不存在' }))
     Write-Host ("哈希校验    : {0}" -f $trustTxt)
     Write-Host ("客户端      : {0}" -f $clTxt)
     Write-Host ("网络连通    : {0}" -f $(if ($on) { '在线' } else { '离线' }))
     Write-Host ("掉线判定    : 连续 {0} 次探测失败（约 {1} 秒）" -f $OfflineSamples, ($OfflineSamples * $PollSec))
 
+    $autostart = @(Get-ClientAutostart)
+    if ($autostart.Count -gt 0) {
+        $alive = @($autostart | Where-Object { $_.Exists })
+        Write-Host ("客户端自启  : 发现 {0} 项（有效 {1} 项），登录时会和计划任务同时拉起" -f $autostart.Count, $alive.Count)
+        foreach ($a in $autostart) {
+            Write-Host ("              [{0}] {1}{2}" -f $a.Name, $a.Value, $(if ($a.Exists) { '' } else { '（死项）' }))
+        }
+    } else {
+        Write-Host '客户端自启  : 未发现（开机只靠本脚本拉起）'
+    }
+
     # 部署副本的日志才有诊断价值（仓库目录那份是开发模式留下的）
     $deployLog = Join-Path $DeployDir 'autologin.log'
-    if (Test-Path $deployLog) {
+    if ((Test-PathAccessible $deployLog) -eq $true) {
         Write-Host ''
         Write-Host '--- 部署副本最近日志 ---'
         try {
@@ -537,6 +781,9 @@ $PID | Out-File $PidFile -Encoding ASCII -Force
 Rotate-Log
 Write-Log ("===== 守护启动（{0}）=====" -f $(if ($IsDeployed) { '部署副本' } else { '开发副本' }))
 Grant-LogRead
+if (-not $IsDeployed -and ((Test-PathAccessible (Join-Path $DeployDir 'TianyiAutoLogin.ps1')) -eq $true)) {
+    Write-Log '注意：当前跑的是源码副本，正式部署副本在 ProgramData，两者可能不一致（改了源码请重新 -Install）'
+}
 if (Get-TrustState -eq 'none') { Write-Log '客户端哈希校验未启用' }
 
 $lastStart    = [datetime]::MinValue
